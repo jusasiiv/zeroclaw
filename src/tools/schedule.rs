@@ -52,7 +52,7 @@ impl Tool for ScheduleTool {
                 },
                 "run_at": {
                     "type": "string",
-                    "description": "Absolute RFC3339 time for one-shot tasks (e.g. '2030-01-01T00:00:00Z')."
+                    "description": "Absolute RFC3339 time for one-shot tasks (e.g. '2030-01-01T00:00:00Z'). Use the 'Current Date & Time' from the system prompt as reference — not dates from MEMORY.md."
                 },
                 "command": {
                     "type": "string",
