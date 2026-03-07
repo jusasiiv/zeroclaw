@@ -192,6 +192,24 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Global registry of running channel instances.
+///
+/// Populated by [`start_channels`] so that other subsystems (e.g. cron delivery)
+/// can reuse the already-connected channel (important for stateful channels like
+/// WhatsApp Web that require an active WebSocket session).
+fn channel_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Look up a running channel instance by name (e.g. `"whatsapp"`).
+pub fn get_running_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    channel_registry()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(name).cloned())
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -3275,6 +3293,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // Populate global channel registry for cross-subsystem access (e.g. cron delivery).
+    if let Ok(mut registry) = channel_registry().lock() {
+        for (name, ch) in channels_by_name.as_ref() {
+            registry.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");

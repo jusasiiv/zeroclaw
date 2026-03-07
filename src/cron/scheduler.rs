@@ -365,18 +365,30 @@ pub(crate) async fn deliver_announcement(
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "whatsapp" => {
-            let wa = config
-                .channels_config
-                .whatsapp
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
-            let channel = WhatsAppChannel::new(
-                wa.access_token.clone().unwrap_or_default(),
-                wa.phone_number_id.clone().unwrap_or_default(),
-                wa.verify_token.clone().unwrap_or_default(),
-                wa.allowed_numbers.clone(),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
+            // Prefer the already-running channel instance (required for WhatsApp Web
+            // which needs an active WebSocket session). Falls back to constructing a
+            // stateless Cloud API channel when no running instance is available.
+            if let Some(running) = crate::channels::get_running_channel("whatsapp") {
+                running.send(&SendMessage::new(output, target)).await?;
+            } else {
+                let wa = config
+                    .channels_config
+                    .whatsapp
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+                if !wa.is_cloud_config() {
+                    anyhow::bail!(
+                        "whatsapp delivery requires a running WhatsApp Web channel or Cloud API config (phone_number_id, access_token, verify_token)"
+                    );
+                }
+                let channel = WhatsAppChannel::new(
+                    wa.access_token.clone().unwrap_or_default(),
+                    wa.phone_number_id.clone().unwrap_or_default(),
+                    wa.verify_token.clone().unwrap_or_default(),
+                    wa.allowed_numbers.clone(),
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
