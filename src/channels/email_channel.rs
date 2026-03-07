@@ -38,7 +38,8 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 /// Email channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmailConfig {
-    /// IMAP server hostname
+    /// IMAP server hostname (leave empty for send-only mode)
+    #[serde(default)]
     pub imap_host: String,
     /// IMAP server port (default: 993 for TLS)
     #[serde(default = "default_imap_port")]
@@ -126,6 +127,11 @@ impl EmailChannel {
             config,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Returns true when IMAP is not configured (send-only mode).
+    pub fn is_send_only(&self) -> bool {
+        self.config.imap_host.is_empty()
     }
 
     /// Check if a sender email is in the allowlist
@@ -537,6 +543,12 @@ impl Channel for EmailChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+        if self.is_send_only() {
+            info!("Email channel running in send-only mode (no IMAP configured)");
+            // Keep the channel alive without polling; exit when all senders drop.
+            tx.closed().await;
+            return Ok(());
+        }
         info!(
             "Starting email channel with IDLE support on {}",
             self.config.imap_folder
@@ -545,6 +557,10 @@ impl Channel for EmailChannel {
     }
 
     async fn health_check(&self) -> bool {
+        if self.is_send_only() {
+            // In send-only mode, verify SMTP is reachable.
+            return self.create_smtp_transport().is_ok();
+        }
         // Fully async health check - attempt IMAP connection
         match timeout(Duration::from_secs(10), self.connect_imap()).await {
             Ok(Ok(mut session)) => {
