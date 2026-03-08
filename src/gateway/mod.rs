@@ -827,7 +827,8 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+/// Simple chat without tools (kept for lightweight/testing use cases).
+#[allow(dead_code)]
 async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
 
@@ -986,7 +987,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    match run_gateway_chat_with_tools(&state, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
