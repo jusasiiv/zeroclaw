@@ -239,7 +239,7 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+pub(crate) async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
@@ -273,7 +273,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
-fn build_hardware_context(
+pub(crate) fn build_hardware_context(
     rag: &crate::rag::HardwareRag,
     user_msg: &str,
     boards: &[String],

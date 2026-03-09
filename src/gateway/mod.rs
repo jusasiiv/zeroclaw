@@ -310,6 +310,9 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// In-memory conversation history for the generic webhook endpoint.
+    /// Persists across requests until process restart or `/new`/`/clear` command.
+    pub webhook_history: Arc<Mutex<Vec<ChatMessage>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -645,6 +648,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        webhook_history: Arc::new(Mutex::new(Vec::new())),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -866,6 +870,263 @@ async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow:
     crate::agent::process_message(config, message).await
 }
 
+/// Stateful webhook chat — maintains conversation history across requests.
+///
+/// On first message: builds system prompt, injects memory + hardware RAG context,
+/// then runs the agent loop. On subsequent messages: appends the new user message
+/// (with timestamp only) and runs the agent loop with accumulated history.
+/// Enforces `config.agent.max_history_messages` cap via FIFO eviction.
+async fn run_webhook_chat_stateful(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+
+    let observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+    let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
+        Arc::from(crate::runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        state.mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+    let peripheral_tools: Vec<Box<dyn crate::tools::Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
+
+    let model_name = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+    };
+    let provider: Box<dyn crate::providers::Provider> =
+        providers::create_routed_provider_with_options(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+
+    let max_history = config.agent.max_history_messages;
+    let had_prior_history;
+
+    // Scope the lock: build or extend history, then release before the LLM call.
+    let mut history = {
+        let mut guard = state.webhook_history.lock();
+        had_prior_history = !guard.is_empty();
+
+        if !had_prior_history {
+            // First message — build system prompt, inject memory + hardware context
+            let skills =
+                crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+            let mut tool_descs: Vec<(&str, &str)> = vec![
+                ("shell", "Execute terminal commands."),
+                ("file_read", "Read file contents."),
+                ("file_write", "Write file contents."),
+                ("memory_store", "Save to memory."),
+                ("memory_recall", "Search memory."),
+                ("memory_forget", "Delete a memory entry."),
+                (
+                    "model_routing_config",
+                    "Configure default model, scenario routing, and delegate agents.",
+                ),
+                ("screenshot", "Capture a screenshot."),
+                ("image_info", "Read image metadata."),
+            ];
+            if config.browser.enabled {
+                tool_descs
+                    .push(("browser_open", "Open approved URLs in browser."));
+            }
+            if config.composio.enabled {
+                tool_descs.push((
+                    "composio",
+                    "Execute actions on 1000+ apps via Composio.",
+                ));
+            }
+            if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
+                tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
+                tool_descs.push(("gpio_write", "Set GPIO pin high or low on connected hardware."));
+                tool_descs.push((
+                    "arduino_upload",
+                    "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+                ));
+                tool_descs.push((
+                    "hardware_memory_map",
+                    "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
+                ));
+                tool_descs.push((
+                    "hardware_board_info",
+                    "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
+                ));
+                tool_descs.push((
+                    "hardware_memory_read",
+                    "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
+                ));
+                tool_descs.push((
+                    "hardware_capabilities",
+                    "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
+                ));
+            }
+            let bootstrap_max_chars = if config.agent.compact_context {
+                Some(6000)
+            } else {
+                None
+            };
+            let native_tools = provider.supports_native_tools();
+            let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+                &config.workspace_dir,
+                &model_name,
+                &tool_descs,
+                &skills,
+                Some(&config.identity),
+                bootstrap_max_chars,
+                native_tools,
+                config.skills.prompt_injection_mode,
+            );
+            if !native_tools {
+                system_prompt
+                    .push_str(&crate::agent::loop_::build_tool_instructions(&tools_registry));
+            }
+
+            guard.push(ChatMessage::system(&system_prompt));
+        }
+
+        // Enrich user message: add memory+RAG context on first, timestamp-only on follow-ups
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if had_prior_history {
+            format!("[{now}] {message}")
+        } else {
+            // Will inject memory context after releasing lock (needs async)
+            // For now, push a placeholder that we'll replace
+            format!("[{now}] {message}")
+        };
+
+        guard.push(ChatMessage::user(&enriched));
+
+        // Enforce history cap (keep system prompt at index 0)
+        while guard.len() > max_history {
+            if guard.len() > 1 {
+                guard.remove(1);
+            } else {
+                break;
+            }
+        }
+
+        guard.clone()
+    };
+
+    // Inject memory + hardware context on first message (needs async, done outside lock)
+    if !had_prior_history {
+        let mem_context = crate::agent::loop_::build_context(
+            state.mem.as_ref(),
+            message,
+            config.memory.min_relevance_score,
+        )
+        .await;
+        let hardware_rag: Option<crate::rag::HardwareRag> = config
+            .peripherals
+            .datasheet_dir
+            .as_ref()
+            .filter(|d| !d.trim().is_empty())
+            .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+            .and_then(Result::ok)
+            .filter(|r| !r.is_empty());
+        let board_names: Vec<String> = config
+            .peripherals
+            .boards
+            .iter()
+            .map(|b| b.board.clone())
+            .collect();
+        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+        let hw_context = hardware_rag
+            .as_ref()
+            .map(|r| crate::agent::loop_::build_hardware_context(r, message, &board_names, rag_limit))
+            .unwrap_or_default();
+        let context = format!("{mem_context}{hw_context}");
+
+        if !context.is_empty() {
+            // Re-enrich the last user message with memory+RAG context prepended
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            let enriched = format!("{context}[{now}] {message}");
+            if let Some(last) = history.last_mut() {
+                *last = ChatMessage::user(&enriched);
+            }
+            // Also update the shared history
+            let mut guard = state.webhook_history.lock();
+            if let Some(last) = guard.last_mut() {
+                *last = ChatMessage::user(&enriched);
+            }
+        }
+    }
+
+    // Run the agent loop
+    let response = crate::agent::loop_::agent_turn(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        observer.as_ref(),
+        provider_name,
+        &model_name,
+        config.default_temperature,
+        true,
+        &config.multimodal,
+        config.agent.max_tool_iterations,
+    )
+    .await?;
+
+    // Persist the new turns (assistant response + any tool-call messages) back to shared history.
+    // The history vec now has new entries appended by agent_turn.
+    {
+        let mut guard = state.webhook_history.lock();
+        let shared_len = guard.len();
+        // agent_turn may have appended multiple messages (tool calls + final response)
+        if history.len() > shared_len {
+            guard.extend_from_slice(&history[shared_len..]);
+        }
+        // Re-enforce cap after assistant turns
+        while guard.len() > max_history {
+            if guard.len() > 1 {
+                guard.remove(1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(response)
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -956,6 +1217,18 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
+    // ── Session reset commands ──
+    let trimmed = message.trim();
+    if trimmed == "/new" || trimmed == "/clear" {
+        state.webhook_history.lock().clear();
+        tracing::info!("Webhook conversation history cleared");
+        let body = serde_json::json!({
+            "response": "Conversation history cleared. Starting fresh.",
+            "model": state.model,
+        });
+        return (StatusCode::OK, Json(body));
+    }
+
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
@@ -987,7 +1260,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_tools(&state, message).await {
+    match run_webhook_chat_stateful(&state, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
