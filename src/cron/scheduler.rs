@@ -390,6 +390,35 @@ pub(crate) async fn deliver_announcement(
                 channel.send(&SendMessage::new(output, target)).await?;
             }
         }
+        "webhook" => {
+            let wh = config
+                .channels_config
+                .webhook
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("webhook channel not configured"))?;
+            let callback = wh
+                .callback_url
+                .as_deref()
+                .or(Some(target))
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "webhook delivery requires a callback_url in [channels.webhook] \
+                         or a URL in delivery.to"
+                    )
+                })?;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            let body = serde_json::json!({
+                "target": target,
+                "message": output,
+            });
+            let resp = client.post(callback).json(&body).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("webhook delivery failed: HTTP {}", resp.status());
+            }
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 

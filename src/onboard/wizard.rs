@@ -4534,6 +4534,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     } else {
                         Some(secret)
                     },
+                    callback_url: None,
                 });
                 println!(
                     "  {} Webhook on port {}",

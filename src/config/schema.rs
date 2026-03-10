@@ -2845,6 +2845,8 @@ pub struct WebhookConfig {
     pub port: u16,
     /// Optional shared secret for webhook signature verification.
     pub secret: Option<String>,
+    /// Optional callback URL for outbound cron delivery (POST JSON `{"target","message"}`).
+    pub callback_url: Option<String>,
 }
 
 impl ChannelConfig for WebhookConfig {

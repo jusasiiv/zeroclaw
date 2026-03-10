@@ -429,6 +429,18 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "webhook" => Some(
+            "When responding on Webhook:\n\
+             - Respond in plain text.\n\
+             - Be concise and direct.\n\
+             - Use *bold* for key terms, section titles, and important info (renders as <b>)\n\
+             - Use _italic_ for emphasis (renders as <i>)\n\
+             - Use `backticks` for inline code, commands, or technical terms\n\
+             - Use triple backticks for code blocks\n\
+             - When scheduling reminders or delayed messages via cron_add, use channel='webhook' \
+               with the user's callback URL as the delivery target. Do NOT assume telegram or other channels.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
         _ => None,
     }
 }
