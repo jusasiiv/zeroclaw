@@ -1026,16 +1026,30 @@ async fn run_webhook_chat_stateful(state: &AppState, message: &str) -> anyhow::R
 
             // Inject channel context so the agent knows it is on the webhook channel.
             // This guides cron_add delivery to use "webhook" instead of guessing telegram/discord.
-            system_prompt.push_str(
-                "\n\nChannel context: You are currently responding on channel=webhook. \
-                 This is an HTTP webhook endpoint — there is no persistent chat connection. \
-                 When scheduling delayed messages or reminders via cron_add, use \
-                 delivery={\"mode\":\"announce\",\"channel\":\"webhook\",\"to\":\"<callback_url>\"} \
-                 where <callback_url> is the URL provided by the user or configured in the webhook \
-                 channel settings. If no callback URL is available, set delivery mode to \"none\" \
-                 and inform the user that the job result will be stored but not delivered. \
-                 Do NOT use telegram, discord, or other channels unless the user explicitly asks."
-            );
+            let webhook_callback = config
+                .channels_config
+                .webhook
+                .as_ref()
+                .and_then(|wh| wh.callback_url.as_deref())
+                .unwrap_or("");
+            if !webhook_callback.is_empty() {
+                system_prompt.push_str(&format!(
+                    "\n\nChannel context: You are currently responding on channel=webhook. \
+                     This is an HTTP webhook endpoint — there is no persistent chat connection. \
+                     The configured callback URL is: {webhook_callback}\n\
+                     When scheduling delayed messages or reminders via cron_add, use \
+                     delivery={{\"mode\":\"announce\",\"channel\":\"webhook\",\"to\":\"{webhook_callback}\"}}. \
+                     Do NOT use telegram, discord, or other channels unless the user explicitly asks."
+                ));
+            } else {
+                system_prompt.push_str(
+                    "\n\nChannel context: You are currently responding on channel=webhook. \
+                     This is an HTTP webhook endpoint — there is no persistent chat connection. \
+                     No callback URL is configured, so set delivery mode to \"none\" for cron jobs \
+                     and inform the user that the job result will be stored but not delivered. \
+                     Do NOT use telegram, discord, or other channels unless the user explicitly asks."
+                );
+            }
 
             guard.push(ChatMessage::system(&system_prompt));
         }
