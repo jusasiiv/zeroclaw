@@ -312,6 +312,10 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
+        "webhook" => {
+            // Webhook delivery uses callback_url from [channels.webhook] config
+            // or the heartbeat.to field as a fallback URL — no strict config requirement.
+        }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
