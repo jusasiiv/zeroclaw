@@ -438,7 +438,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use `backticks` for inline code, commands, or technical terms\n\
              - Use triple backticks for code blocks\n\
              - When scheduling reminders or delayed messages via cron_add, use channel='webhook' \
-               with the user's callback URL as the delivery target. Do NOT assume telegram or other channels.\n\
+               with the user's phone number (E.164 format) as the delivery target. Do NOT put a URL in delivery.to. Do NOT assume telegram or other channels.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         _ => None,

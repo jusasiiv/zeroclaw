@@ -1036,9 +1036,11 @@ async fn run_webhook_chat_stateful(state: &AppState, message: &str) -> anyhow::R
                 system_prompt.push_str(&format!(
                     "\n\nChannel context: You are currently responding on channel=webhook. \
                      This is an HTTP webhook endpoint — there is no persistent chat connection. \
-                     The configured callback URL is: {webhook_callback}\n\
+                     A callback URL is configured — cron delivery will use it automatically. \
                      When scheduling delayed messages or reminders via cron_add, use \
-                     delivery={{\"mode\":\"announce\",\"channel\":\"webhook\",\"to\":\"{webhook_callback}\"}}. \
+                     delivery={{\"mode\":\"announce\",\"channel\":\"webhook\",\"to\":\"+<user_phone>\"}} \
+                     where +<user_phone> is the recipient's phone number in E.164 format. \
+                     NEVER put a URL in delivery.to — the callback URL is handled internally. \
                      Do NOT use telegram, discord, or other channels unless the user explicitly asks."
                 ));
             } else {
