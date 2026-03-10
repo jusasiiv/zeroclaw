@@ -410,6 +410,21 @@ pub(crate) async fn deliver_announcement(
                          or a URL in delivery.to"
                     )
                 })?;
+
+            // When callback_url is configured, delivery.to is the *recipient*
+            // (e.g. a phone number), not the URL. Catch the common mistake
+            // where the agent puts the URL in both places.
+            if configured_url.is_some()
+                && (target.starts_with("http://") || target.starts_with("https://"))
+            {
+                anyhow::bail!(
+                    "webhook delivery.to should be the recipient (e.g. a phone number), \
+                     not the callback URL. callback_url is already configured as '{}'. \
+                     Set delivery.to to the target recipient instead.",
+                    configured_url.unwrap_or_default()
+                );
+            }
+
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()?;

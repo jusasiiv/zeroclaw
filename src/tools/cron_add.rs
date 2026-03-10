@@ -59,7 +59,8 @@ impl Tool for CronAddTool {
          To deliver output to a channel (Discord, Telegram, Slack, Mattermost, WhatsApp, Webhook), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          For WhatsApp, use channel='whatsapp' and to='+<phone>' (E.164 format). \
-         For Webhook, use channel='webhook' and to='<callback_url>' (the URL that will receive a POST with JSON {\"target\",\"message\"}). \
+         For Webhook, use channel='webhook' and to='<recipient>' (e.g. E.164 phone number like '+358449110577'). \
+         NEVER put a URL in delivery.to — the callback URL is configured separately in [channels_config.webhook]. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels. \
          IMPORTANT: When computing 'at' times or relative delays, always use the current date/time \
          from the system prompt 'Current Date & Time' section — never use dates from MEMORY.md or \
@@ -86,7 +87,7 @@ impl Tool for CronAddTool {
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
                         "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "whatsapp", "webhook"], "description": "Channel type to deliver to" },
-                        "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, WhatsApp phone number (E.164), Webhook callback URL, etc." },
+                        "to": { "type": "string", "description": "Target recipient: Discord channel ID, Telegram chat ID, Slack channel, WhatsApp/Webhook phone number (E.164). Never a URL." },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }
                 },
