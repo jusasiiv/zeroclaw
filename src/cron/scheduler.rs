@@ -419,7 +419,14 @@ pub(crate) async fn deliver_announcement(
             });
             let resp = client.post(callback).json(&body).send().await?;
             if !resp.status().is_success() {
-                anyhow::bail!("webhook delivery failed: HTTP {}", resp.status());
+                let status = resp.status();
+                let resp_body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<no body>".to_string());
+                anyhow::bail!(
+                    "webhook delivery failed: HTTP {status} — {resp_body}"
+                );
             }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
