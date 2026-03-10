@@ -391,14 +391,17 @@ pub(crate) async fn deliver_announcement(
             }
         }
         "webhook" => {
-            let wh = config
+            // Prefer callback_url from [channels.webhook] config if present,
+            // otherwise fall back to delivery.to (the target). The gateway
+            // serves the webhook endpoint directly so the channel config
+            // section is optional.
+            let configured_url = config
                 .channels_config
                 .webhook
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("webhook channel not configured"))?;
-            let callback = wh
-                .callback_url
-                .as_deref()
+                .and_then(|wh| wh.callback_url.as_deref())
+                .filter(|u| !u.is_empty());
+            let callback = configured_url
                 .or(Some(target))
                 .filter(|u| !u.is_empty())
                 .ok_or_else(|| {
