@@ -211,17 +211,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
-                    let announcement = if output.trim().is_empty() {
-                        "heartbeat task executed".to_string()
-                    } else {
-                        output
-                    };
+                    // Allow the agent to suppress delivery by responding
+                    // with [NO_SEND] (anywhere in the output).
+                    let trimmed = output.trim();
+                    if trimmed.is_empty()
+                        || trimmed.contains("[NO_SEND]")
+                    {
+                        tracing::info!("Heartbeat: agent signalled no delivery needed");
+                        continue;
+                    }
                     if let Some((channel, target)) = &delivery {
                         if let Err(e) = crate::cron::scheduler::deliver_announcement(
                             &config,
                             channel,
                             target,
-                            &announcement,
+                            &output,
                         )
                         .await
                         {
