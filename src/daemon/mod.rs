@@ -195,52 +195,56 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             continue;
         }
 
-        for task in tasks {
-            let prompt = format!("[Heartbeat Task] {task}");
-            let temp = config.default_temperature;
-            match crate::agent::run(
-                config.clone(),
-                Some(prompt),
-                None,
-                None,
-                temp,
-                vec![],
-                false,
-            )
-            .await
-            {
-                Ok(output) => {
-                    crate::health::mark_component_ok("heartbeat");
-                    // Allow the agent to suppress delivery by responding
-                    // with [NO_SEND] (anywhere in the output).
-                    let trimmed = output.trim();
-                    if trimmed.is_empty()
-                        || trimmed.contains("[NO_SEND]")
+        // Combine all tasks into a single prompt so the agent processes
+        // everything in one run instead of responding per-task.
+        let combined = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("{}. {t}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!("[Heartbeat] Consider all of the following together:\n{combined}");
+        let temp = config.default_temperature;
+        match crate::agent::run(
+            config.clone(),
+            Some(prompt),
+            None,
+            None,
+            temp,
+            vec![],
+            false,
+        )
+        .await
+        {
+            Ok(output) => {
+                crate::health::mark_component_ok("heartbeat");
+                let trimmed = output.trim();
+                if trimmed.is_empty()
+                    || trimmed.contains("[NO_SEND]")
+                {
+                    tracing::info!("Heartbeat: agent signalled no delivery needed");
+                    continue;
+                }
+                if let Some((channel, target)) = &delivery {
+                    if let Err(e) = crate::cron::scheduler::deliver_announcement(
+                        &config,
+                        channel,
+                        target,
+                        &output,
+                    )
+                    .await
                     {
-                        tracing::info!("Heartbeat: agent signalled no delivery needed");
-                        continue;
-                    }
-                    if let Some((channel, target)) = &delivery {
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &output,
-                        )
-                        .await
-                        {
-                            crate::health::mark_component_error(
-                                "heartbeat",
-                                format!("delivery failed: {e}"),
-                            );
-                            tracing::warn!("Heartbeat delivery failed: {e}");
-                        }
+                        crate::health::mark_component_error(
+                            "heartbeat",
+                            format!("delivery failed: {e}"),
+                        );
+                        tracing::warn!("Heartbeat delivery failed: {e}");
                     }
                 }
-                Err(e) => {
-                    crate::health::mark_component_error("heartbeat", e.to_string());
-                    tracing::warn!("Heartbeat task failed: {e}");
-                }
+            }
+            Err(e) => {
+                crate::health::mark_component_error("heartbeat", e.to_string());
+                tracing::warn!("Heartbeat task failed: {e}");
             }
         }
     }
