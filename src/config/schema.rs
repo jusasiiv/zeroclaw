@@ -217,6 +217,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Gemini provider-specific configuration (`[gemini]`).
+    #[serde(default)]
+    pub gemini: GeminiConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -234,6 +238,16 @@ pub struct ModelProviderConfig {
     /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
     #[serde(default)]
     pub requires_openai_auth: bool,
+}
+
+/// Gemini provider-specific configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct GeminiConfig {
+    /// Enable grounding with Google Search. When true, Gemini will use live
+    /// Google Search results to ground its responses with real-time information.
+    /// Only applies when the active provider is Gemini.
+    #[serde(default)]
+    pub google_search_grounding: bool,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────

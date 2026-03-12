@@ -352,6 +352,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            google_search_grounding: config.gemini.google_search_grounding,
         },
     )?);
     let model = config
@@ -926,6 +927,7 @@ async fn run_webhook_chat_stateful(state: &AppState, message: &str) -> anyhow::R
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        google_search_grounding: config.gemini.google_search_grounding,
     };
     let provider: Box<dyn crate::providers::Provider> =
         providers::create_routed_provider_with_options(

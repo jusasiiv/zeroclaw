@@ -24,6 +24,9 @@ pub struct GeminiProvider {
     auth_service: Option<AuthService>,
     /// Override profile name for managed auth.
     auth_profile_override: Option<String>,
+    /// When true, include `{"google_search": {}}` in the `tools` array
+    /// so Gemini grounds its responses with live Google Search results.
+    google_search_grounding: bool,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -89,6 +92,16 @@ struct GenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiToolDecl>>,
+}
+
+/// A tool declaration for the Gemini `tools` array.
+/// Currently only supports the built-in `google_search` grounding tool.
+#[derive(Debug, Serialize, Clone)]
+struct GeminiToolDecl {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_search: Option<serde_json::Value>,
 }
 
 /// Request envelope for the internal cloudcode-pa API.
@@ -125,6 +138,8 @@ struct InternalGenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiToolDecl>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -175,6 +190,35 @@ struct InternalGenerateContentResponse {
 struct Candidate {
     #[serde(default)]
     content: Option<CandidateContent>,
+    /// Grounding metadata returned when the `google_search` tool is enabled.
+    #[serde(default, rename = "groundingMetadata")]
+    grounding_metadata: Option<GroundingMetadata>,
+}
+
+/// Metadata returned by Gemini when grounding with Google Search is active.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GroundingMetadata {
+    #[serde(default, rename = "webSearchQueries")]
+    web_search_queries: Option<Vec<String>>,
+    #[serde(default, rename = "groundingChunks")]
+    grounding_chunks: Option<Vec<GroundingChunk>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GroundingChunk {
+    #[serde(default)]
+    web: Option<GroundingWeb>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GroundingWeb {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,6 +493,7 @@ impl GeminiProvider {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            google_search_grounding: false,
         }
     }
 
@@ -522,7 +567,13 @@ impl GeminiProvider {
                 None
             },
             auth_profile_override: profile_override,
+            google_search_grounding: false,
         }
+    }
+
+    /// Enable or disable Gemini grounding with Google Search.
+    pub fn set_google_search_grounding(&mut self, enabled: bool) {
+        self.google_search_grounding = enabled;
     }
 
     fn normalize_non_empty(value: &str) -> Option<String> {
@@ -898,6 +949,7 @@ impl GeminiProvider {
                         } else {
                             None
                         },
+                        tools: request.tools.clone(),
                     },
                 };
                 self.http_client()
@@ -980,6 +1032,14 @@ impl GeminiProvider {
             _ => (None, None),
         };
 
+        let tools = if self.google_search_grounding {
+            Some(vec![GeminiToolDecl {
+                google_search: Some(serde_json::json!({})),
+            }])
+        } else {
+            None
+        };
+
         let request = GenerateContentRequest {
             contents,
             system_instruction,
@@ -987,6 +1047,7 @@ impl GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
             },
+            tools,
         };
 
         let url = Self::build_generate_content_url(model, auth);
@@ -1130,9 +1191,34 @@ impl GeminiProvider {
             output_tokens: u.candidates_token_count,
         });
 
-        let text = result
-            .candidates
-            .and_then(|c| c.into_iter().next())
+        let candidate = result.candidates.and_then(|c| c.into_iter().next());
+
+        // Log grounding metadata when Google Search grounding is active.
+        if let Some(ref c) = candidate {
+            if let Some(ref meta) = c.grounding_metadata {
+                if let Some(ref queries) = meta.web_search_queries {
+                    tracing::debug!(queries = ?queries, "Gemini grounding search queries");
+                }
+                if let Some(ref chunks) = meta.grounding_chunks {
+                    let sources: Vec<_> = chunks
+                        .iter()
+                        .filter_map(|c| c.web.as_ref())
+                        .filter_map(|w| {
+                            Some(format!(
+                                "{} ({})",
+                                w.title.as_deref().unwrap_or("?"),
+                                w.uri.as_deref().unwrap_or("?")
+                            ))
+                        })
+                        .collect();
+                    if !sources.is_empty() {
+                        tracing::debug!(sources = ?sources, "Gemini grounding sources");
+                    }
+                }
+            }
+        }
+
+        let text = candidate
             .and_then(|c| c.content)
             .and_then(|c| c.effective_text())
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
@@ -1348,6 +1434,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            google_search_grounding: false,
         }
     }
 

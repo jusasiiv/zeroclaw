@@ -47,6 +47,7 @@ impl WebSearchTool {
         }
 
         let html = response.text().await?;
+        tracing::debug!(html_len = html.len(), "DuckDuckGo response received");
         self.parse_duckduckgo_results(&html, query)
     }
 
@@ -70,6 +71,11 @@ impl WebSearchTool {
             .collect();
 
         if link_matches.is_empty() {
+            tracing::warn!(
+                query,
+                html_len = html.len(),
+                "DuckDuckGo returned HTML but no results matched parser regex — possible captcha, rate-limit, or layout change"
+            );
             return Ok(format!("No results found for: {}", query));
         }
 
@@ -217,8 +223,20 @@ impl Tool for WebSearchTool {
         tracing::info!("Searching web for: {}", query);
 
         let result = match self.provider.as_str() {
-            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
-            "brave" => self.search_brave(query).await?,
+            "duckduckgo" | "ddg" => match self.search_duckduckgo(query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(provider = "duckduckgo", query, error = %e, "Web search failed");
+                    return Err(e);
+                }
+            },
+            "brave" => match self.search_brave(query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(provider = "brave", query, error = %e, "Web search failed");
+                    return Err(e);
+                }
+            },
             _ => anyhow::bail!(
                 "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
                 self.provider

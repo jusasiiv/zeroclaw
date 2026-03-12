@@ -676,6 +676,8 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    /// Enable Gemini grounding with Google Search (only affects the Gemini provider).
+    pub google_search_grounding: bool,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -686,6 +688,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            google_search_grounding: false,
         }
     }
 }
@@ -988,11 +991,15 @@ fn create_provider_with_url_and_options(
                     )
                 });
             let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
-            Ok(Box::new(gemini::GeminiProvider::new_with_auth(
+            let mut provider = gemini::GeminiProvider::new_with_auth(
                 key,
                 auth_service,
                 options.auth_profile_override.clone(),
-            )))
+            );
+            if options.google_search_grounding {
+                provider.set_google_search_grounding(true);
+            }
+            Ok(Box::new(provider))
         }
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 

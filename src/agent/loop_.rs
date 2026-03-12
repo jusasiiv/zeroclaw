@@ -1960,6 +1960,7 @@ async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            tracing::warn!(tool = call_name, error = %e, ?duration, "Tool execution failed");
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
@@ -2806,6 +2807,7 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        google_search_grounding: config.gemini.google_search_grounding,
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3264,6 +3266,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        google_search_grounding: config.gemini.google_search_grounding,
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
