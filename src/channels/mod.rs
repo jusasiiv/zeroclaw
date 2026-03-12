@@ -300,11 +300,11 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
-/// `<tool_call>`, `<toolcall>`, `<tool-call>`, `<tool>`, or `<invoke>`
-/// blocks that are internal protocol and must not be forwarded to end
-/// users on any channel.
+/// `<tool_call>`, `<toolcall>`, `<tool-call>`, `<tool>`, `<invoke>`,
+/// or `<tool_result>` blocks that are internal protocol and must not
+/// be forwarded to end users on any channel.
 fn strip_tool_call_tags(message: &str) -> String {
-    const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
+    const TOOL_CALL_OPEN_TAGS: [&str; 10] = [
         "<function_calls>",
         "<function_call>",
         "<tool_call>",
@@ -312,6 +312,9 @@ fn strip_tool_call_tags(message: &str) -> String {
         "<tool-call>",
         "<tool>",
         "<invoke>",
+        "<tool_result>",
+        "<tool_code>",
+        "<tool-code>",
     ];
 
     fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
@@ -329,6 +332,9 @@ fn strip_tool_call_tags(message: &str) -> String {
             "<tool-call>" => Some("</tool-call>"),
             "<tool>" => Some("</tool>"),
             "<invoke>" => Some("</invoke>"),
+            "<tool_result>" => Some("</tool_result>"),
+            "<tool_code>" => Some("</tool_code>"),
+            "<tool-code>" => Some("</tool-code>"),
             _ => None,
         }
     }
@@ -1255,7 +1261,8 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    let cleaned = strip_isolated_tool_json_artifacts(response, &known_tool_names);
+    strip_tool_call_tags(&cleaned)
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
