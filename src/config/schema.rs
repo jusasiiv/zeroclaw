@@ -3627,6 +3627,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            gemini: GeminiConfig::default(),
         }
     }
 }
