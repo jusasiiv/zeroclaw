@@ -58,8 +58,9 @@ impl Tool for CronAddTool {
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
          To deliver output to a channel (Discord, Telegram, Slack, Mattermost, WhatsApp, Webhook), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
-         For WhatsApp, use channel='whatsapp' and to='+<phone>' (E.164 format). \
-         For Webhook, use channel='webhook' and to='<recipient>' (e.g. E.164 phone number like '+358449110577'). \
+         For WhatsApp or Webhook delivery, just set channel='whatsapp' or channel='webhook' — \
+         the recipient phone number is filled in automatically from the agent config. \
+         Do NOT provide delivery.to for whatsapp/webhook channels; it will be overridden. \
          NEVER put a URL in delivery.to — the callback URL is configured separately in [channels_config.webhook]. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels. \
          IMPORTANT: When computing 'at' times or relative delays, always use the current date/time \
@@ -225,7 +226,24 @@ impl Tool for CronAddTool {
 
                 let delivery = match args.get("delivery") {
                     Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
-                        Ok(cfg) => Some(cfg),
+                        Ok(mut cfg) => {
+                            // For phone-based channels, override delivery.to with the
+                            // provisioned phone number from config so the LLM cannot
+                            // hallucinate a wrong number.
+                            let is_phone_channel = cfg
+                                .channel
+                                .as_deref()
+                                .map_or(false, |ch| {
+                                    ch.eq_ignore_ascii_case("webhook")
+                                        || ch.eq_ignore_ascii_case("whatsapp")
+                                });
+                            if is_phone_channel {
+                                if let Some(ref phone) = self.config.heartbeat.to {
+                                    cfg.to = Some(phone.clone());
+                                }
+                            }
+                            Some(cfg)
+                        }
                         Err(e) => {
                             return Ok(ToolResult {
                                 success: false,

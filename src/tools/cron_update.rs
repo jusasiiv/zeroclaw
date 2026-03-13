@@ -54,7 +54,9 @@ impl Tool for CronUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)"
+        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.). \
+         Note: for whatsapp/webhook delivery, delivery.to is always overridden with the \
+         provisioned phone number from agent config."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -104,7 +106,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
+        let mut patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
             Ok(patch) => patch,
             Err(e) => {
                 return Ok(ToolResult {
@@ -114,6 +116,24 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+
+        // Override delivery.to for phone-based channels so the LLM cannot
+        // hallucinate a wrong number.
+        if let Some(ref mut delivery) = patch.delivery {
+            let is_phone_channel = delivery
+                .channel
+                .as_deref()
+                .map_or(false, |ch| {
+                    ch.eq_ignore_ascii_case("webhook")
+                        || ch.eq_ignore_ascii_case("whatsapp")
+                });
+            if is_phone_channel {
+                if let Some(ref phone) = self.config.heartbeat.to {
+                    delivery.to = Some(phone.clone());
+                }
+            }
+        }
+
         let approved = args
             .get("approved")
             .and_then(serde_json::Value::as_bool)
