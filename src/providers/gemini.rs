@@ -1040,6 +1040,39 @@ impl GeminiProvider {
             None
         };
 
+        // When grounding is enabled, augment the system instruction so the model
+        // knows that Google Search is handled transparently by the API and must
+        // NOT be invoked via `<tool_code>` code-execution blocks.  Without this
+        // nudge, Gemini sometimes confuses prompt-based tool calling (XML tags)
+        // with the built-in search tool and emits un-executable Python code.
+        let system_instruction = if self.google_search_grounding {
+            let grounding_note = concat!(
+                "\n\n## Google Search\n\n",
+                "Google Search grounding is enabled and handled AUTOMATICALLY by the API. ",
+                "When you need web information, simply answer the question naturally — the system ",
+                "will transparently search Google and ground your response with real-time results. ",
+                "Do NOT output <tool_code>, <tool-code>, or python code blocks to call google_search. ",
+                "Do NOT try to invoke google_search as a function or tool call. ",
+                "Just respond naturally and the search happens behind the scenes.",
+            );
+            match system_instruction {
+                Some(mut si) => {
+                    if let Some(part) = si.parts.first_mut() {
+                        part.text.push_str(grounding_note);
+                    }
+                    Some(si)
+                }
+                None => Some(Content {
+                    role: None,
+                    parts: vec![Part {
+                        text: grounding_note.to_string(),
+                    }],
+                }),
+            }
+        } else {
+            system_instruction
+        };
+
         let request = GenerateContentRequest {
             contents,
             system_instruction,
@@ -1193,27 +1226,34 @@ impl GeminiProvider {
 
         let candidate = result.candidates.and_then(|c| c.into_iter().next());
 
+        // Extract grounding metadata before consuming the candidate.
+        let grounding_sources: Vec<String> = candidate
+            .as_ref()
+            .and_then(|c| c.grounding_metadata.as_ref())
+            .and_then(|meta| meta.grounding_chunks.as_ref())
+            .map(|chunks| {
+                chunks
+                    .iter()
+                    .filter_map(|c| c.web.as_ref())
+                    .filter_map(|w| {
+                        Some(format!(
+                            "{} ({})",
+                            w.title.as_deref().unwrap_or("?"),
+                            w.uri.as_deref().unwrap_or("?")
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // Log grounding metadata when Google Search grounding is active.
         if let Some(ref c) = candidate {
             if let Some(ref meta) = c.grounding_metadata {
                 if let Some(ref queries) = meta.web_search_queries {
                     tracing::debug!(queries = ?queries, "Gemini grounding search queries");
                 }
-                if let Some(ref chunks) = meta.grounding_chunks {
-                    let sources: Vec<_> = chunks
-                        .iter()
-                        .filter_map(|c| c.web.as_ref())
-                        .filter_map(|w| {
-                            Some(format!(
-                                "{} ({})",
-                                w.title.as_deref().unwrap_or("?"),
-                                w.uri.as_deref().unwrap_or("?")
-                            ))
-                        })
-                        .collect();
-                    if !sources.is_empty() {
-                        tracing::debug!(sources = ?sources, "Gemini grounding sources");
-                    }
+                if !grounding_sources.is_empty() {
+                    tracing::debug!(sources = ?grounding_sources, "Gemini grounding sources");
                 }
             }
         }
@@ -1222,6 +1262,35 @@ impl GeminiProvider {
             .and_then(|c| c.content)
             .and_then(|c| c.effective_text())
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+
+        // Gemini sometimes emits `<tool_code>print(google_search.search(...))</tool_code>`
+        // blocks in its text output when it tries to invoke built-in tools via code execution
+        // rather than the grounding API. These are not executable by ZeroClaw and confuse the
+        // agent loop, so strip them here.
+        let text = strip_tool_code_blocks(&text);
+
+        // If the entire response was a <tool_code> block (now stripped), the text
+        // will be empty. In that case, if grounding sources are available, return
+        // a synthesised response so the user still sees something useful.
+        let text = if text.is_empty() && !grounding_sources.is_empty() {
+            tracing::warn!(
+                "Gemini response was entirely <tool_code>; synthesising from grounding sources"
+            );
+            format!(
+                "Here are some relevant sources I found:\n{}",
+                grounding_sources
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        } else if text.is_empty() {
+            // No useful content at all — the agent loop will treat this as an
+            // error and may retry with a fallback provider.
+            anyhow::bail!("Gemini returned only <tool_code> blocks with no usable text");
+        } else {
+            text
+        };
 
         Ok((text, usage))
     }
@@ -1408,6 +1477,73 @@ impl Provider for GeminiProvider {
         }
         Ok(())
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RESPONSE TEXT CLEANUP
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Strip `<tool_code>…</tool_code>` and `<tool-code>…</tool-code>` blocks from
+/// Gemini response text.
+///
+/// Gemini sometimes emits Python code-execution blocks such as
+/// `<tool_code>print(google_search.search(queries=[…]))</tool_code>` when it
+/// attempts to invoke built-in tools (e.g. Google Search grounding) via the
+/// code-execution pathway instead of the server-side grounding API.  These
+/// blocks are not executable by ZeroClaw and, if left in the response, confuse
+/// the agent loop (they contain no parseable tool-call JSON).
+fn strip_tool_code_blocks(text: &str) -> String {
+    const OPEN_TAGS: [&str; 2] = ["<tool_code>", "<tool-code>"];
+    const CLOSE_TAGS: [&str; 2] = ["</tool_code>", "</tool-code>"];
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    loop {
+        // Find the earliest opening tag.
+        let next = OPEN_TAGS
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tag)| remaining.find(tag).map(|pos| (pos, i, *tag)))
+            .min_by_key(|(pos, _, _)| *pos);
+
+        let Some((start, tag_idx, open_tag)) = next else {
+            // No more tags — append the rest and we're done.
+            result.push_str(remaining);
+            break;
+        };
+
+        // Keep everything before the tag.
+        result.push_str(&remaining[..start]);
+
+        let after_open = &remaining[start + open_tag.len()..];
+        let close_tag = CLOSE_TAGS[tag_idx];
+
+        if let Some(close_pos) = after_open.find(close_tag) {
+            // Found matching close tag — skip the entire block.
+            let skipped = &after_open[..close_pos];
+            tracing::debug!(
+                block = %skipped.chars().take(120).collect::<String>(),
+                "Stripped <tool_code> block from Gemini response"
+            );
+            remaining = &after_open[close_pos + close_tag.len()..];
+        } else {
+            // No close tag — strip everything from the open tag onward.
+            tracing::debug!("Stripped unclosed <tool_code> block from Gemini response");
+            break;
+        }
+    }
+
+    // Clean up resulting blank lines.
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = trimmed.to_string();
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2229,5 +2365,54 @@ mod tests {
         let result = provider.warmup().await;
         // Should succeed without making HTTP requests
         assert!(result.is_ok());
+    }
+
+    // ── strip_tool_code_blocks tests ────────────────────────────────────
+
+    #[test]
+    fn strip_tool_code_preserves_plain_text() {
+        assert_eq!(
+            strip_tool_code_blocks("Hello, world!"),
+            "Hello, world!"
+        );
+    }
+
+    #[test]
+    fn strip_tool_code_removes_google_search_block() {
+        let input = r#"<tool_code>
+print(google_search.search(queries=["latest AI news", "tech updates"]))
+</tool_code>"#;
+        assert_eq!(strip_tool_code_blocks(input), "");
+    }
+
+    #[test]
+    fn strip_tool_code_keeps_surrounding_text() {
+        let input = "Here is my answer.\n<tool_code>print(google_search.search(queries=[\"test\"]))</tool_code>\nMore text.";
+        assert_eq!(
+            strip_tool_code_blocks(input),
+            "Here is my answer.\n\nMore text."
+        );
+    }
+
+    #[test]
+    fn strip_tool_code_handles_tool_call_then_tool_code() {
+        let input = "<tool_call>\n{\"name\":\"memory_recall\",\"arguments\":{\"query\":\"test\"}}\n</tool_call><tool_code>\nprint(google_search.search(queries=[\"test\"]))\n</tool_code>";
+        let result = strip_tool_code_blocks(input);
+        assert!(result.contains("<tool_call>"));
+        assert!(result.contains("memory_recall"));
+        assert!(!result.contains("<tool_code>"));
+        assert!(!result.contains("google_search"));
+    }
+
+    #[test]
+    fn strip_tool_code_handles_hyphenated_variant() {
+        let input = "<tool-code>print(google_search.search(queries=[\"q\"]))</tool-code>";
+        assert_eq!(strip_tool_code_blocks(input), "");
+    }
+
+    #[test]
+    fn strip_tool_code_handles_unclosed_tag() {
+        let input = "Some text\n<tool_code>\nprint(google_search.search(queries=[\"q\"]))";
+        assert_eq!(strip_tool_code_blocks(input), "Some text");
     }
 }
