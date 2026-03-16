@@ -310,56 +310,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             }
         }
 
-        // Combine all tasks into a single prompt so the agent processes
-        // everything in one run instead of responding per-task.
-        let combined = tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| format!("{}. {t}", i + 1))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prompt = format!("[Heartbeat] Consider all of the following together:\n{combined}");
-        let temp = config.default_temperature;
-        match crate::agent::run(
-            config.clone(),
-            Some(prompt),
-            None,
-            None,
-            temp,
-            vec![],
-            false,
-        )
-        .await
-        {
-            Ok(output) => {
-                crate::health::mark_component_ok("heartbeat");
-                let trimmed = output.trim();
-                if trimmed.is_empty()
-                    || trimmed.contains("[NO_SEND]")
-                {
-                    tracing::info!("Heartbeat: agent signalled no delivery needed");
-                    continue;
-                }
-                if let Some((channel, target)) = &delivery {
-                    if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                        &config,
-                        channel,
-                        target,
-                        &output,
-                    )
-                    .await
-                    {
-                        crate::health::mark_component_error(
-                            "heartbeat",
-                            format!("delivery failed: {e}"),
-                        );
-                        tracing::warn!("Heartbeat delivery failed: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
         // ── Phase 1: LLM decision (two-phase mode) ──────────────
         let tasks_to_run = if two_phase {
             let decision_prompt = HeartbeatEngine::build_decision_prompt(&tasks);

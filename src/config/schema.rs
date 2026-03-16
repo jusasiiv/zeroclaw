@@ -299,6 +299,10 @@ pub struct Config {
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     pub node_transport: NodeTransportConfig,
+
+    /// Gemini provider-specific configuration (`[gemini]`).
+    #[serde(default)]
+    pub gemini: GeminiConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -347,10 +351,6 @@ impl Default for WorkspaceConfig {
             cross_workspace_search: false,
         }
     }
-
-    /// Gemini provider-specific configuration (`[gemini]`).
-    #[serde(default)]
-    pub gemini: GeminiConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -381,16 +381,6 @@ pub struct ModelProviderConfig {
     /// Azure OpenAI API version (defaults to "2024-08-01-preview").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_openai_api_version: Option<String>,
-}
-
-/// Gemini provider-specific configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct GeminiConfig {
-    /// Enable grounding with Google Search. When true, Gemini will use live
-    /// Google Search results to ground its responses with real-time information.
-    /// Only applies when the active provider is Gemini.
-    #[serde(default)]
-    pub google_search_grounding: bool,
 }
 
 /// Gemini provider-specific configuration.
