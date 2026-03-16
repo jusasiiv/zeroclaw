@@ -68,6 +68,9 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// Default subject line for outgoing emails (default: "ZeroClaw Message")
+    #[serde(default = "default_subject")]
+    pub default_subject: String,
 }
 
 impl crate::config::traits::ChannelConfig for EmailConfig {
@@ -94,6 +97,9 @@ fn default_idle_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_subject() -> String {
+    "ZeroClaw Message".into()
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -109,6 +115,7 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
+            default_subject: default_subject(),
         }
     }
 }
@@ -518,16 +525,17 @@ impl Channel for EmailChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Use explicit subject if provided, otherwise fall back to legacy parsing or default
+        let default_subject = self.config.default_subject.as_str();
         let (subject, body) = if let Some(ref subj) = message.subject {
             (subj.as_str(), message.content.as_str())
         } else if message.content.starts_with("Subject: ") {
             if let Some(pos) = message.content.find('\n') {
                 (&message.content[9..pos], message.content[pos + 1..].trim())
             } else {
-                ("ZeroClaw Message", message.content.as_str())
+                (default_subject, message.content.as_str())
             }
         } else {
-            ("ZeroClaw Message", message.content.as_str())
+            (default_subject, message.content.as_str())
         };
 
         let email = Message::builder()
@@ -651,10 +659,12 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            default_subject: "Custom Subject".to_string(),
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
         assert_eq!(config.idle_timeout_secs, 1200);
+        assert_eq!(config.default_subject, "Custom Subject");
     }
 
     #[test]
@@ -671,11 +681,13 @@ mod tests {
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            default_subject: "Test Subject".to_string(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
         assert_eq!(cloned.smtp_port, config.smtp_port);
         assert_eq!(cloned.allowed_senders, config.allowed_senders);
+        assert_eq!(cloned.default_subject, config.default_subject);
     }
 
     // EmailChannel tests
@@ -916,6 +928,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            default_subject: "Serialization Test".to_string(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -924,6 +937,7 @@ mod tests {
         assert_eq!(deserialized.imap_host, config.imap_host);
         assert_eq!(deserialized.smtp_port, config.smtp_port);
         assert_eq!(deserialized.allowed_senders, config.allowed_senders);
+        assert_eq!(deserialized.default_subject, config.default_subject);
     }
 
     #[test]
@@ -941,6 +955,7 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
+        assert_eq!(config.default_subject, "ZeroClaw Message"); // default
     }
 
     #[test]

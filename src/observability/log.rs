@@ -27,7 +27,7 @@ impl Observer for LogObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(provider = %provider, model = %model, duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
             }
-            ObserverEvent::ToolCallStart { tool } => {
+            ObserverEvent::ToolCallStart { tool, .. } => {
                 info!(tool = %tool, "tool.start");
             }
             ObserverEvent::ToolCall {
@@ -46,6 +46,15 @@ impl Observer for LogObserver {
             }
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
+            }
+            ObserverEvent::CacheHit {
+                cache_type,
+                tokens_saved,
+            } => {
+                info!(cache_type = %cache_type, tokens_saved = tokens_saved, "cache.hit");
+            }
+            ObserverEvent::CacheMiss { cache_type } => {
+                info!(cache_type = %cache_type, "cache.miss");
             }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");

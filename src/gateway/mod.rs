@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod nodes;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -313,6 +314,10 @@ pub struct AppState {
     /// In-memory conversation history for the generic webhook endpoint.
     /// Persists across requests until process restart or `/new`/`/clear` command.
     pub webhook_history: Arc<Mutex<Vec<ChatMessage>>>,
+    /// Shutdown signal sender for graceful shutdown
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Registry of dynamically connected nodes
+    pub node_registry: Arc<nodes::NodeRegistry>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -353,6 +358,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
             google_search_grounding: config.gemini.google_search_grounding,
+            provider_timeout_secs: Some(config.provider_timeout_secs),
+            extra_headers: config.extra_headers.clone(),
+            api_path: config.api_path.clone(),
         },
     )?);
     let model = config
@@ -360,8 +368,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -382,7 +391,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry_raw = tools::all_tools_with_runtime(
+    let (tools_registry_raw, _delegate_handle_gw) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -596,6 +605,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
+    if config.nodes.enabled {
+        println!("  GET  /ws/nodes  — WebSocket node discovery");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -626,6 +638,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             event_tx.clone(),
         ));
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Node registry for dynamic node discovery
+    let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -650,6 +667,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         webhook_history: Arc::new(Mutex::new(Vec::new())),
+        shutdown_tx,
+        node_registry,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -659,6 +678,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Build router with middleware
     let app = Router::new()
+        // ── Admin routes (for CLI management) ──
+        .route("/admin/shutdown", post(handle_admin_shutdown))
+        .route("/admin/paircode", get(handle_admin_paircode))
+        .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -677,7 +700,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
         .route("/api/integrations", get(api::handle_api_integrations))
+        .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integrations_settings),
+        )
         .route(
             "/api/doctor",
             get(api::handle_api_doctor).post(api::handle_api_doctor),
@@ -692,6 +720,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket node discovery ──
+        .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
@@ -705,11 +735,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
-    // Run the server
+    // Run the server with graceful shutdown
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.changed().await;
+        tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+    })
     .await?;
 
     Ok(())
@@ -733,17 +767,31 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 /// Prometheus content type for text exposition format.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+fn prometheus_disabled_hint() -> String {
+    String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+}
+
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = if let Some(prom) = state
-        .observer
-        .as_ref()
-        .as_any()
-        .downcast_ref::<crate::observability::PrometheusObserver>()
-    {
-        prom.encode()
-    } else {
-        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    let body = {
+        #[cfg(feature = "observability-prometheus")]
+        {
+            if let Some(prom) = state
+                .observer
+                .as_ref()
+                .as_any()
+                .downcast_ref::<crate::observability::PrometheusObserver>()
+            {
+                prom.encode()
+            } else {
+                prometheus_disabled_hint()
+            }
+        }
+        #[cfg(not(feature = "observability-prometheus"))]
+        {
+            let _ = &state;
+            prometheus_disabled_hint()
+        }
     };
 
     (
@@ -868,7 +916,299 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
 async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+    Box::pin(crate::agent::process_message(config, message)).await
+}
+
+/// Stateful webhook chat — maintains conversation history across requests.
+///
+/// On first message: builds system prompt, injects memory + hardware RAG context,
+/// then runs the agent loop. On subsequent messages: appends the new user message
+/// (with timestamp only) and runs the agent loop with accumulated history.
+/// Enforces `config.agent.max_history_messages` cap via FIFO eviction.
+async fn run_webhook_chat_stateful(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+
+    let observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+    let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
+        Arc::from(crate::runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        state.mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+    let peripheral_tools: Vec<Box<dyn crate::tools::Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
+
+    let model_name = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        google_search_grounding: config.gemini.google_search_grounding,
+    };
+    let provider: Box<dyn crate::providers::Provider> =
+        providers::create_routed_provider_with_options(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+
+    let max_history = config.agent.max_history_messages;
+    let had_prior_history;
+
+    // Scope the lock: build or extend history, then release before the LLM call.
+    let mut history = {
+        let mut guard = state.webhook_history.lock();
+        had_prior_history = !guard.is_empty();
+
+        if !had_prior_history {
+            // First message — build system prompt, inject memory + hardware context
+            let skills =
+                crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+            let mut tool_descs: Vec<(&str, &str)> = vec![
+                ("shell", "Execute terminal commands."),
+                ("file_read", "Read file contents."),
+                ("file_write", "Write file contents."),
+                ("memory_store", "Save to memory."),
+                ("memory_recall", "Search memory."),
+                ("memory_forget", "Delete a memory entry."),
+                (
+                    "model_routing_config",
+                    "Configure default model, scenario routing, and delegate agents.",
+                ),
+                ("screenshot", "Capture a screenshot."),
+                ("image_info", "Read image metadata."),
+                ("cron_add", "Create a scheduled cron job (shell or agent) with cron/at/every schedules. Use for reminders, delayed messages, periodic tasks."),
+                ("cron_list", "List all cron jobs."),
+                ("cron_remove", "Remove a cron job by ID."),
+                ("cron_update", "Update a cron job."),
+                ("cron_run", "Run a cron job immediately."),
+            ];
+            if config.browser.enabled {
+                tool_descs
+                    .push(("browser_open", "Open approved URLs in browser."));
+            }
+            if config.composio.enabled {
+                tool_descs.push((
+                    "composio",
+                    "Execute actions on 1000+ apps via Composio.",
+                ));
+            }
+            if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
+                tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
+                tool_descs.push(("gpio_write", "Set GPIO pin high or low on connected hardware."));
+                tool_descs.push((
+                    "arduino_upload",
+                    "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+                ));
+                tool_descs.push((
+                    "hardware_memory_map",
+                    "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
+                ));
+                tool_descs.push((
+                    "hardware_board_info",
+                    "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
+                ));
+                tool_descs.push((
+                    "hardware_memory_read",
+                    "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
+                ));
+                tool_descs.push((
+                    "hardware_capabilities",
+                    "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
+                ));
+            }
+            let bootstrap_max_chars = if config.agent.compact_context {
+                Some(6000)
+            } else {
+                None
+            };
+            let native_tools = provider.supports_native_tools();
+            let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+                &config.workspace_dir,
+                &model_name,
+                &tool_descs,
+                &skills,
+                Some(&config.identity),
+                bootstrap_max_chars,
+                native_tools,
+                config.skills.prompt_injection_mode,
+            );
+            if !native_tools {
+                system_prompt
+                    .push_str(&crate::agent::loop_::build_tool_instructions(&tools_registry));
+            }
+
+            // Inject channel context so the agent knows it is on the webhook channel.
+            // This guides cron_add delivery to use "webhook" instead of guessing telegram/discord.
+            let webhook_callback = config
+                .channels_config
+                .webhook
+                .as_ref()
+                .and_then(|wh| wh.callback_url.as_deref())
+                .unwrap_or("");
+            if !webhook_callback.is_empty() {
+                system_prompt.push_str(&format!(
+                    "\n\nChannel context: You are currently responding on channel=webhook. \
+                     This is an HTTP webhook endpoint — there is no persistent chat connection. \
+                     A callback URL is configured — cron delivery will use it automatically. \
+                     When scheduling delayed messages or reminders via cron_add, use \
+                     delivery={{\"mode\":\"announce\",\"channel\":\"webhook\",\"to\":\"+<user_phone>\"}} \
+                     where +<user_phone> is the recipient's phone number in E.164 format. \
+                     NEVER put a URL in delivery.to — the callback URL is handled internally. \
+                     Do NOT use telegram, discord, or other channels unless the user explicitly asks."
+                ));
+            } else {
+                system_prompt.push_str(
+                    "\n\nChannel context: You are currently responding on channel=webhook. \
+                     This is an HTTP webhook endpoint — there is no persistent chat connection. \
+                     No callback URL is configured, so set delivery mode to \"none\" for cron jobs \
+                     and inform the user that the job result will be stored but not delivered. \
+                     Do NOT use telegram, discord, or other channels unless the user explicitly asks."
+                );
+            }
+
+            guard.push(ChatMessage::system(&system_prompt));
+        }
+
+        // Enrich user message: add memory+RAG context on first, timestamp-only on follow-ups
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if had_prior_history {
+            format!("[{now}] {message}")
+        } else {
+            // Will inject memory context after releasing lock (needs async)
+            // For now, push a placeholder that we'll replace
+            format!("[{now}] {message}")
+        };
+
+        guard.push(ChatMessage::user(&enriched));
+
+        // Enforce history cap (keep system prompt at index 0)
+        while guard.len() > max_history {
+            if guard.len() > 1 {
+                guard.remove(1);
+            } else {
+                break;
+            }
+        }
+
+        guard.clone()
+    };
+
+    // Inject memory + hardware context on first message (needs async, done outside lock)
+    if !had_prior_history {
+        let mem_context = crate::agent::loop_::build_context(
+            state.mem.as_ref(),
+            message,
+            config.memory.min_relevance_score,
+        )
+        .await;
+        let hardware_rag: Option<crate::rag::HardwareRag> = config
+            .peripherals
+            .datasheet_dir
+            .as_ref()
+            .filter(|d| !d.trim().is_empty())
+            .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+            .and_then(Result::ok)
+            .filter(|r| !r.is_empty());
+        let board_names: Vec<String> = config
+            .peripherals
+            .boards
+            .iter()
+            .map(|b| b.board.clone())
+            .collect();
+        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+        let hw_context = hardware_rag
+            .as_ref()
+            .map(|r| crate::agent::loop_::build_hardware_context(r, message, &board_names, rag_limit))
+            .unwrap_or_default();
+        let context = format!("{mem_context}{hw_context}");
+
+        if !context.is_empty() {
+            // Re-enrich the last user message with memory+RAG context prepended
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            let enriched = format!("{context}[{now}] {message}");
+            if let Some(last) = history.last_mut() {
+                *last = ChatMessage::user(&enriched);
+            }
+            // Also update the shared history
+            let mut guard = state.webhook_history.lock();
+            if let Some(last) = guard.last_mut() {
+                *last = ChatMessage::user(&enriched);
+            }
+        }
+    }
+
+    // Run the agent loop
+    let response = crate::agent::loop_::agent_turn(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        observer.as_ref(),
+        provider_name,
+        &model_name,
+        config.default_temperature,
+        true,
+        &config.multimodal,
+        config.agent.max_tool_iterations,
+    )
+    .await?;
+
+    // Persist the new turns (assistant response + any tool-call messages) back to shared history.
+    // The history vec now has new entries appended by agent_turn.
+    {
+        let mut guard = state.webhook_history.lock();
+        let shared_len = guard.len();
+        // agent_turn may have appended multiple messages (tool calls + final response)
+        if history.len() > shared_len {
+            guard.extend_from_slice(&history[shared_len..]);
+        }
+        // Re-enforce cap after assistant turns
+        while guard.len() > max_history {
+            if guard.len() > 1 {
+                guard.remove(1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 /// Stateful webhook chat — maintains conversation history across requests.
@@ -1500,7 +1840,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1608,7 +1948,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1700,7 +2040,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 // Send reply via WATI
                 if let Err(e) = wati
@@ -1804,7 +2144,7 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1826,6 +2166,109 @@ async fn handle_nextcloud_talk_webhook(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ADMIN HANDLERS (for CLI management)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Response for admin endpoints
+#[derive(serde::Serialize)]
+struct AdminResponse {
+    success: bool,
+    message: String,
+}
+
+/// Reject requests that do not originate from a loopback address.
+fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Admin endpoints are restricted to localhost"
+            })),
+        ))
+    }
+}
+
+/// POST /admin/shutdown — graceful shutdown from CLI (localhost only)
+async fn handle_admin_shutdown(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    tracing::info!("🔌 Admin shutdown request received — initiating graceful shutdown");
+
+    let body = AdminResponse {
+        success: true,
+        message: "Gateway shutdown initiated".to_string(),
+    };
+
+    let _ = state.shutdown_tx.send(true);
+
+    Ok((StatusCode::OK, Json(body)))
+}
+
+/// GET /admin/paircode — fetch current pairing code (localhost only)
+async fn handle_admin_paircode(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let code = state.pairing.pairing_code();
+
+    let body = if let Some(c) = code {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": c,
+            "message": "Use this one-time code to pair"
+        })
+    } else {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": null,
+            "message": if state.pairing.require_pairing() {
+                "Pairing is active but no new code available (already paired or code expired)"
+            } else {
+                "Pairing is disabled for this gateway"
+            }
+        })
+    };
+
+    Ok((StatusCode::OK, Json(body)))
+}
+
+/// POST /admin/paircode/new — generate a new pairing code (localhost only)
+async fn handle_admin_paircode_new(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    match state.pairing.generate_new_pairing_code() {
+        Some(code) => {
+            tracing::info!("🔐 New pairing code generated via admin endpoint");
+            let body = serde_json::json!({
+                "success": true,
+                "pairing_required": state.pairing.require_pairing(),
+                "pairing_code": code,
+                "message": "New pairing code generated — use this one-time code to pair"
+            });
+            Ok((StatusCode::OK, Json(body)))
+        }
+        None => {
+            let body = serde_json::json!({
+                "success": false,
+                "pairing_required": false,
+                "pairing_code": null,
+                "message": "Pairing is disabled for this gateway"
+            });
+            Ok((StatusCode::BAD_REQUEST, Json(body)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1910,6 +2353,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1927,6 +2372,7 @@ mod tests {
         assert!(text.contains("Prometheus backend not enabled"));
     }
 
+    #[cfg(feature = "observability-prometheus")]
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let prom = Arc::new(crate::observability::PrometheusObserver::new());
@@ -1959,6 +2405,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2125,16 +2573,24 @@ mod tests {
             .await
             .unwrap();
 
-        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
-        let parsed: Config = toml::from_str(&saved).unwrap();
-        assert_eq!(parsed.gateway.paired_tokens.len(), 1);
-        let persisted = &parsed.gateway.paired_tokens[0];
-        assert_eq!(persisted.len(), 64);
-        assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+        // In-memory tokens should remain as plaintext 64-char hex hashes.
+        let plaintext = {
+            let in_memory = shared_config.lock();
+            assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+            in_memory.gateway.paired_tokens[0].clone()
+        };
+        assert_eq!(plaintext.len(), 64);
+        assert!(plaintext.chars().all(|c: char| c.is_ascii_hexdigit()));
 
-        let in_memory = shared_config.lock();
-        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
-        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
+        // On disk, the token should be encrypted (secrets.encrypt defaults to true).
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
+        let raw_parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(raw_parsed.gateway.paired_tokens.len(), 1);
+        let on_disk = &raw_parsed.gateway.paired_tokens[0];
+        assert!(
+            crate::security::SecretStore::is_encrypted(on_disk),
+            "paired_token should be encrypted on disk"
+        );
     }
 
     #[test]
@@ -2325,6 +2781,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2389,6 +2847,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let headers = HeaderMap::new();
@@ -2465,6 +2925,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let response = handle_webhook(
@@ -2513,6 +2975,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2566,6 +3030,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2624,13 +3090,15 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
-        let response = handle_nextcloud_talk_webhook(
+        let response = Box::pin(handle_nextcloud_talk_webhook(
             State(state),
             HeaderMap::new(),
             Bytes::from_static(br#"{"type":"message"}"#),
-        )
+        ))
         .await
         .into_response();
 
@@ -2678,6 +3146,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2690,9 +3160,13 @@ mod tests {
             HeaderValue::from_str(invalid_signature).unwrap(),
         );
 
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
@@ -3083,5 +3557,34 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn require_localhost_accepts_ipv4_loopback() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        assert!(require_localhost(&peer).is_ok());
+    }
+
+    #[test]
+    fn require_localhost_accepts_ipv6_loopback() {
+        let peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 12345));
+        assert!(require_localhost(&peer).is_ok());
+    }
+
+    #[test]
+    fn require_localhost_rejects_non_loopback_ipv4() {
+        let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
+        let err = require_localhost(&peer).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn require_localhost_rejects_non_loopback_ipv6() {
+        let peer = SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            12345,
+        ));
+        let err = require_localhost(&peer).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }
