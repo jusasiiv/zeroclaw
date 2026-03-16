@@ -40,7 +40,10 @@ pub enum ObserverEvent {
         cost_usd: Option<f64>,
     },
     /// A tool call is about to be executed.
-    ToolCallStart { tool: String },
+    ToolCallStart {
+        tool: String,
+        arguments: Option<String>,
+    },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
         tool: String,
@@ -58,6 +61,18 @@ pub enum ObserverEvent {
     },
     /// Periodic heartbeat tick from the runtime keep-alive loop.
     HeartbeatTick,
+    /// Response cache hit — an LLM call was avoided.
+    CacheHit {
+        /// `"hot"` (in-memory) or `"warm"` (SQLite).
+        cache_type: String,
+        /// Estimated tokens saved by this cache hit.
+        tokens_saved: u64,
+    },
+    /// Response cache miss — the prompt was not found in cache.
+    CacheMiss {
+        /// `"response"` cache layer that was checked.
+        cache_type: String,
+    },
     /// An error occurred in a named component.
     Error {
         /// Subsystem where the error originated (e.g., `"provider"`, `"gateway"`).
