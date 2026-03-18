@@ -72,7 +72,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
             },
         ));
     }
@@ -116,7 +116,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
+                async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
             },
         ));
     } else {
@@ -127,6 +127,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
+    if config.gateway.require_pairing {
+        println!("   Pairing:    enabled (code appears in gateway output above)");
+    }
     println!("   Ctrl+C or SIGTERM to stop");
 
     // Wait for shutdown signal (SIGINT or SIGTERM)
@@ -643,6 +646,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -756,6 +760,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
@@ -772,6 +777,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
