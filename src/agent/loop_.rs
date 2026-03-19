@@ -452,7 +452,7 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(
+pub(crate) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,

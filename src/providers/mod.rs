@@ -724,6 +724,7 @@ pub fn provider_runtime_options_from_config(
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
+        google_search_grounding: config.gemini.google_search_grounding,
     }
 }
 

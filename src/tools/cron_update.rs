@@ -204,7 +204,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match deserialize_maybe_stringified::<CronJobPatch>(&patch_val) {
+        let mut patch = match deserialize_maybe_stringified::<CronJobPatch>(&patch_val) {
             Ok(patch) => patch,
             Err(e) => {
                 return Ok(ToolResult {
